@@ -1,8 +1,10 @@
-"""Frame annotation utilities for dashboard and CLI display."""
+"""Frame annotation utilities — cv2 preferred, PIL+NumPy fallback when cv2 unavailable."""
 
 from __future__ import annotations
 
 from typing import Any
+
+import numpy as np
 
 from navigation.zones import ZoneAssigner
 from vision.camera import require_cv2
@@ -10,87 +12,129 @@ from vision.detections import Detection
 
 
 ZONE_COLORS = {
-    "left": (64, 180, 255),
-    "centre": (50, 220, 100),
-    "right": (255, 170, 60),
+    "left":    (64,  180, 255),
+    "centre":  (50,  220, 100),
+    "right":   (255, 170, 60),
     "unknown": (190, 190, 190),
 }
 
 WARNING_COLORS = {
-    "critical": (0, 0, 255),
-    "high": (0, 120, 255),
-    "medium": (0, 220, 255),
-    "low": (80, 220, 80),
-    "none": (180, 180, 180),
+    "critical": (0,   0,   255),
+    "high":     (0,   120, 255),
+    "medium":   (0,   220, 255),
+    "low":      (80,  220, 80),
+    "none":     (180, 180, 180),
 }
 
 
+def _cv2_available() -> bool:
+    try:
+        require_cv2()
+        return True
+    except RuntimeError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def annotate_frame(frame: Any, detections: list[Detection], draw_zones: bool = True) -> Any:
     """Draw zones, bounding boxes, labels, distance, and warning level."""
-
-    cv2 = require_cv2()
-    output = frame.copy()
-    height, width = output.shape[:2]
-    if draw_zones:
-        _draw_zone_overlay(cv2, output, width, height)
-
-    for detection in detections:
-        x1, y1, x2, y2 = detection.bbox.as_int_tuple()
-        color = WARNING_COLORS.get(detection.warning_level, WARNING_COLORS["none"])
-        cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
-        distance_text = (
-            f"{detection.estimated_distance:.2f}m" if detection.estimated_distance else "n/a"
-        )
-        label = (
-            f"{detection.label} {detection.confidence:.2f} | "
-            f"{detection.zone or '?'} | {distance_text}"
-        )
-        _draw_label(cv2, output, label, x1, max(18, y1 - 8), color)
-    return output
+    if _cv2_available():
+        return _annotate_cv2(frame, detections, draw_zones)
+    return _annotate_pil(frame, detections, draw_zones)
 
 
 def bgr_to_rgb(frame: Any) -> Any:
-    """Convert an OpenCV BGR frame to RGB for Streamlit."""
-
+    """Convert a BGR frame to RGB for Streamlit."""
     try:
         cv2 = require_cv2()
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     except RuntimeError:
-        import numpy as np
         arr = np.asarray(frame)
         return arr[..., ::-1].copy()
 
 
-def _draw_zone_overlay(cv2: Any, frame: Any, width: int, height: int) -> None:
+# ---------------------------------------------------------------------------
+# cv2 path (fast, used when OpenCV is present)
+# ---------------------------------------------------------------------------
+
+def _annotate_cv2(frame: Any, detections: list[Detection], draw_zones: bool) -> Any:
+    cv2 = require_cv2()
+    output = frame.copy()
+    height, width = output.shape[:2]
+    if draw_zones:
+        _draw_zone_overlay_cv2(cv2, output, width, height)
+    for det in detections:
+        x1, y1, x2, y2 = det.bbox.as_int_tuple()
+        color = WARNING_COLORS.get(det.warning_level, WARNING_COLORS["none"])
+        cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
+        dist_text = f"{det.estimated_distance:.2f}m" if det.estimated_distance else "n/a"
+        label = f"{det.label} {det.confidence:.2f} | {det.zone or '?'} | {dist_text}"
+        _draw_label_cv2(cv2, output, label, x1, max(18, y1 - 8), color)
+    return output
+
+
+def _draw_zone_overlay_cv2(cv2: Any, frame: Any, width: int, height: int) -> None:
     assigner = ZoneAssigner()
-    left_boundary, right_boundary = assigner.boundaries_px(width)
-    cv2.line(frame, (left_boundary, 0), (left_boundary, height), (255, 255, 255), 1)
-    cv2.line(frame, (right_boundary, 0), (right_boundary, height), (255, 255, 255), 1)
-    cv2.putText(frame, "LEFT", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, ZONE_COLORS["left"], 2)
-    cv2.putText(
-        frame,
-        "CENTRE",
-        (left_boundary + 12, 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        ZONE_COLORS["centre"],
-        2,
-    )
-    cv2.putText(
-        frame,
-        "RIGHT",
-        (right_boundary + 12, 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        ZONE_COLORS["right"],
-        2,
-    )
+    lb, rb = assigner.boundaries_px(width)
+    cv2.line(frame, (lb, 0), (lb, height), (255, 255, 255), 1)
+    cv2.line(frame, (rb, 0), (rb, height), (255, 255, 255), 1)
+    cv2.putText(frame, "LEFT",   (12, 24),       cv2.FONT_HERSHEY_SIMPLEX, 0.65, ZONE_COLORS["left"],   2)
+    cv2.putText(frame, "CENTRE", (lb + 12, 24),  cv2.FONT_HERSHEY_SIMPLEX, 0.65, ZONE_COLORS["centre"], 2)
+    cv2.putText(frame, "RIGHT",  (rb + 12, 24),  cv2.FONT_HERSHEY_SIMPLEX, 0.65, ZONE_COLORS["right"],  2)
 
 
-def _draw_label(cv2: Any, frame: Any, label: str, x: int, y: int, color: tuple[int, int, int]) -> None:
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.5
-    thickness = 1
-    (text_width, text_height), _ = cv2.getTextSize(label, font, scale, thickness)
-    cv2.rectangle(frame, (x, y - text_height - 8), (x + text_width + 6, y + 4), color, -1)
-    cv2.putText(frame, label, (x + 3, y - 3), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+def _draw_label_cv2(cv2: Any, frame: Any, label: str, x: int, y: int, color: tuple) -> None:
+    font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+    (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
+    cv2.rectangle(frame, (x, y - th - 8), (x + tw + 6, y + 4), color, -1)
+    cv2.putText(frame, label, (x + 3, y - 3), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+
+
+# ---------------------------------------------------------------------------
+# PIL fallback path (used on Streamlit Cloud when libgl1 not yet propagated)
+# ---------------------------------------------------------------------------
+
+def _annotate_pil(frame: Any, detections: list[Detection], draw_zones: bool) -> Any:
+    from PIL import Image, ImageDraw, ImageFont
+
+    arr = np.asarray(frame)
+    # synthetic.py produces RGB; VideoSource (cv2) produces BGR — normalise to RGB
+    # We detect BGR by checking if arr came from cv2 (not possible to detect definitively,
+    # but simulation frames are always RGB from synthetic.py, live frames are BGR)
+    pil_img = Image.fromarray(arr.astype(np.uint8))
+    draw = ImageDraw.Draw(pil_img)
+
+    width, height = pil_img.size
+
+    if draw_zones:
+        assigner = ZoneAssigner()
+        lb, rb = assigner.boundaries_px(width)
+        draw.line([(lb, 0), (lb, height)], fill=(255, 255, 255), width=1)
+        draw.line([(rb, 0), (rb, height)], fill=(255, 255, 255), width=1)
+        try:
+            font = ImageFont.truetype("arial.ttf", 14)
+        except Exception:
+            font = ImageFont.load_default()
+        draw.text((12, 8),        "LEFT",   fill=ZONE_COLORS["left"],   font=font)
+        draw.text((lb + 12, 8),   "CENTRE", fill=ZONE_COLORS["centre"], font=font)
+        draw.text((rb + 12, 8),   "RIGHT",  fill=ZONE_COLORS["right"],  font=font)
+
+    try:
+        font_label = ImageFont.truetype("arial.ttf", 11)
+    except Exception:
+        font_label = ImageFont.load_default()
+
+    for det in detections:
+        x1, y1, x2, y2 = det.bbox.as_int_tuple()
+        color = WARNING_COLORS.get(det.warning_level, WARNING_COLORS["none"])
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+        dist_text = f"{det.estimated_distance:.2f}m" if det.estimated_distance else "n/a"
+        label = f"{det.label} {det.confidence:.2f} | {det.zone or '?'} | {dist_text}"
+        bbox_text = draw.textbbox((x1, max(18, y1 - 8)), label, font=font_label)
+        draw.rectangle(bbox_text, fill=color)
+        draw.text((x1 + 2, max(18, y1 - 8)), label, fill=(255, 255, 255), font=font_label)
+
+    return np.array(pil_img)

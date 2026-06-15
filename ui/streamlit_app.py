@@ -258,11 +258,14 @@ def _render_live_tab() -> None:
         st.error(f"Could not open video source: {exc}")
         return
 
-    try:
-        require_cv2()
-    except RuntimeError as exc:
-        st.error(str(exc))
-        return
+    # cv2 is only needed for webcam / video-file sources, not simulation or upload-via-PIL
+    _needs_cv2 = cfg["source_mode"] in ("Webcam (local)", "Video file")
+    if _needs_cv2:
+        try:
+            require_cv2()
+        except RuntimeError as exc:
+            st.error(str(exc))
+            return
 
     detector   = create_detector(
         ModelConfig(model_path=cfg["model_path"], confidence=cfg["confidence"], use_mock=cfg["use_mock"]),
@@ -405,19 +408,26 @@ def _sim_frames(max_frames: int):
 # ---------------------------------------------------------------------------
 
 def _render_browser_camera_mode(cfg: dict) -> None:
-    """Browser camera with two sub-modes:
-    1. Snapshot mode (st.camera_input) — works on every platform including Streamlit Cloud.
-    2. Live WebRTC mode (streamlit-webrtc) — lower latency but requires STUN reachability.
+    """Browser camera.
+    On Streamlit Cloud: only Snapshot mode (st.camera_input) — WebRTC needs open UDP ports.
+    Locally: choose between Snapshot and Live WebRTC.
     """
     import numpy as np
     from PIL import Image as _PILImage
 
-    cam_mode = st.radio(
-        "Camera method",
-        ["Snapshot (works everywhere)", "Live WebRTC (lower latency)"],
-        horizontal=True,
-        help="Snapshot captures one frame at a time. WebRTC streams continuously.",
-    )
+    if _IS_CLOUD:
+        cam_mode = "Snapshot (works everywhere)"
+        st.info(
+            "Running on Streamlit Cloud — using **Snapshot** mode. "
+            "Press the camera button below to capture a frame and run detection."
+        )
+    else:
+        cam_mode = st.radio(
+            "Camera method",
+            ["Snapshot (works everywhere)", "Live WebRTC (lower latency)"],
+            horizontal=True,
+            help="Snapshot captures one frame at a time. WebRTC streams continuously.",
+        )
 
     detector   = create_detector(
         ModelConfig(
