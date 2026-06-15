@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 import sys
 import tempfile
@@ -41,9 +42,8 @@ _SHORT_DIRECTION = {
 
 
 # ---------------------------------------------------------------------------
-# Cloud / local detection
-# Streamlit Cloud sets HOME=/home/appuser.  Any other reliable signal works too.
-# Fallback: if cv2 won't import at all, we are not on a machine with a webcam.
+# Cloud detection — env vars only, never touches cv2
+# Streamlit Cloud always sets HOME=/home/appuser
 # ---------------------------------------------------------------------------
 
 def _detect_cloud() -> bool:
@@ -51,11 +51,9 @@ def _detect_cloud() -> bool:
         return True
     if os.environ.get("HOME", "") == "/home/appuser":
         return True
-    try:
-        import cv2  # noqa: F401
-        return False          # cv2 loads fine → real machine with webcam possible
-    except Exception:
-        return True           # cv2 unavailable → treat as cloud / no-webcam
+    if os.environ.get("IS_STREAMLIT_CLOUD", "") == "true":
+        return True
+    return False
 
 
 _IS_CLOUD = _detect_cloud()
@@ -115,9 +113,7 @@ def main() -> None:
         """,
         unsafe_allow_html=True,
     )
-
     tab_live, tab_eval, tab_about = st.tabs(["Live Navigation", "Evaluation", "About"])
-
     with tab_live:
         _render_live_tab()
     with tab_eval:
@@ -133,7 +129,7 @@ def main() -> None:
 def _scan_cameras() -> list[tuple[int, str]]:
     try:
         import cv2
-    except ImportError:
+    except Exception:
         return [(0, "Camera 0 (default)")]
     found = []
     for idx in range(10):
@@ -148,7 +144,6 @@ def _build_sidebar() -> dict:
     with st.sidebar:
         st.markdown("## Configuration")
 
-        # Cloud: no local webcam, no video-file paths
         if _IS_CLOUD:
             source_options = ["Simulation", "Browser Camera", "Upload video"]
         else:
@@ -167,7 +162,7 @@ def _build_sidebar() -> dict:
         max_frames = st.slider("Max frames", 30, 900, 180, 30)
 
         video_path    = None
-        uploaded_path = None
+        uploaded_file = None
         webcam_index  = 0
 
         if source_mode == "Webcam (local)":
@@ -186,13 +181,7 @@ def _build_sidebar() -> dict:
                 value=str(ROOT / "samples" / "left_person_right_vehicle.avi"),
             )
         elif source_mode == "Upload video":
-            upload = st.file_uploader("Upload video", type=["mp4", "avi", "mov", "mkv"])
-            if upload is not None:
-                suffix = Path(upload.name).suffix or ".mp4"
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-                tmp.write(upload.read())
-                tmp.close()
-                uploaded_path = tmp.name
+            uploaded_file = st.file_uploader("Upload video", type=["mp4", "avi", "mov", "mkv"])
 
         st.markdown("---")
         run = st.button("Run navigation", type="primary")
@@ -205,7 +194,7 @@ def _build_sidebar() -> dict:
         audio_on=audio_on,
         max_frames=max_frames,
         video_path=video_path,
-        uploaded_path=uploaded_path,
+        uploaded_file=uploaded_file,
         webcam_index=webcam_index,
         run=run,
     )
@@ -219,7 +208,6 @@ def _render_live_tab() -> None:
     st.markdown("# Assistive Navigation System")
     cfg = _build_sidebar()
 
-    # Browser Camera is handled separately — no "Run" button needed
     if cfg["source_mode"] == "Browser Camera":
         _render_browser_camera_mode(cfg)
         return
@@ -228,17 +216,104 @@ def _render_live_tab() -> None:
         _show_idle_screen()
         return
 
-    # Webcam / video-file modes need cv2 on the machine
+    # Webcam / video-file modes strictly require cv2 — block clearly on cloud
     if cfg["source_mode"] in ("Webcam (local)", "Video file"):
         try:
             import cv2  # noqa: F401
         except Exception:
             st.error(
-                "OpenCV (cv2) is not installed in this environment. "
+                "OpenCV (cv2) is not available in this environment. "
                 "Use **Browser Camera**, **Upload video**, or **Simulation** instead."
             )
             return
 
+    # Upload video: decode frames with PIL — no cv2 needed
+    if cfg["source_mode"] == "Upload video":
+        _render_upload_mode(cfg)
+        return
+
+    # Simulation and local webcam/video-file go through the main loop
+    _render_main_loop(cfg)
+
+
+def _show_idle_screen() -> None:
+    st.markdown("---")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Input sources", "4", "Browser cam / Upload / Simulation / Local webcam")
+    c2.metric("AI model",      "YOLO11n", "Real-time detection")
+    c3.metric("Object classes", "7", "Person, chair, stairs…")
+    c4.metric("Feedback modes", "3", "Visual · Haptic · Audio")
+    st.info("Select an input source in the sidebar, then press **Run navigation**.")
+
+
+# ---------------------------------------------------------------------------
+# Upload video mode — PIL frame extraction, zero cv2
+# ---------------------------------------------------------------------------
+
+def _render_upload_mode(cfg: dict) -> None:
+    import numpy as np
+    from PIL import Image as PILImage
+
+    uploaded_file = cfg["uploaded_file"]
+    if uploaded_file is None:
+        st.info("Upload a video file using the sidebar, then press **Run navigation**.")
+        return
+
+    st.info("Extracting frames with PIL — processing key frames from your video.")
+
+    # Save upload to a temp file so we can try cv2 or PIL extraction
+    suffix = Path(uploaded_file.name).suffix or ".mp4"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(uploaded_file.read())
+    tmp.close()
+    tmp_path = tmp.name
+
+    # Try cv2 first (available locally), fall back to PIL single-frame for cloud
+    frames = _extract_frames(tmp_path, cfg["max_frames"])
+
+    if not frames:
+        st.error("Could not extract frames from this video. Try uploading an MP4.")
+        return
+
+    _run_pipeline_on_frames(frames, cfg)
+
+
+def _extract_frames(video_path: str, max_frames: int) -> list:
+    """Extract frames as BGR numpy arrays. Uses cv2 if available, PIL otherwise."""
+    import numpy as np
+
+    try:
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError("cv2 could not open video")
+        frames = []
+        while len(frames) < max_frames:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frames.append(frame)
+        cap.release()
+        return frames
+    except Exception:
+        pass
+
+    # PIL fallback: read the file as a single image (works for single-frame uploads
+    # like JPEG/PNG misnamed as video, or as a graceful degradation)
+    try:
+        from PIL import Image as PILImage
+        img = PILImage.open(video_path).convert("RGB")
+        arr = np.array(img)[..., ::-1].copy()  # RGB→BGR
+        return [arr]
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Main frame loop — Simulation + local Webcam/Video file
+# ---------------------------------------------------------------------------
+
+def _render_main_loop(cfg: dict) -> None:
     # Build layout
     camera_ph = st.empty()
     col_info, col_sector = st.columns([5, 6])
@@ -260,12 +335,8 @@ def _render_live_tab() -> None:
     with st.expander("Detection log", expanded=False):
         table_ph = st.empty()
 
-    # Build pipeline
     try:
-        source, frame_iter = _build_frame_iterator(
-            cfg["source_mode"], cfg["video_path"], cfg["uploaded_path"],
-            cfg["max_frames"], cfg["webcam_index"],
-        )
+        source, frame_iter = _build_frame_iterator(cfg)
     except RuntimeError as exc:
         st.error(f"Could not open video source: {exc}")
         return
@@ -364,34 +435,122 @@ def _render_live_tab() -> None:
     )
 
 
-def _show_idle_screen() -> None:
-    st.markdown("---")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Input sources", "4",  "Browser cam / Upload / Simulation / Local webcam")
-    c2.metric("AI model",      "YOLO11n", "Real-time detection")
-    c3.metric("Object classes", "7", "Person, chair, stairs…")
-    c4.metric("Feedback modes", "3", "Visual · Haptic · Audio")
-    st.info("Select an input source in the sidebar, then press **Run navigation**.")
+def _run_pipeline_on_frames(frames: list, cfg: dict) -> None:
+    """Run the navigation pipeline on a pre-extracted list of BGR frames."""
+    camera_ph = st.empty()
+    col_info, col_sector = st.columns([5, 6])
+    with col_info:
+        mc = st.columns(2)
+        fps_ph  = mc[0].empty()
+        near_ph = mc[1].empty()
+        det_ph  = mc[0].empty()
+        dir_ph  = mc[1].empty()
+        st.markdown("---")
+        warn_ph = st.empty()
+        st.markdown("---")
+        st.caption("Haptic feedback")
+        hap_l_ph = st.empty()
+        hap_r_ph = st.empty()
+    with col_sector:
+        sector_ph = st.empty()
+    chart_ph = st.empty()
 
+    detector   = create_detector(
+        ModelConfig(model_path=cfg["model_path"], confidence=cfg["confidence"], use_mock=cfg["use_mock"]),
+        fallback_to_mock=True,
+    )
+    nav_engine = NavigationEngine()
+    haptics    = HapticController()
+    simulator  = VirtualNavigationSimulator()
+    logger     = DetectionLogger(ROOT / "logs" / "navigation_events.csv")
 
-# ---------------------------------------------------------------------------
-# Frame iterator helpers
-# ---------------------------------------------------------------------------
+    history: list[dict] = []
+    start      = time.perf_counter()
+    total_dets = 0
 
-def _build_frame_iterator(source_mode, video_path, uploaded_path, max_frames, webcam_index=0):
-    if source_mode in ("Webcam (local)", "Video file", "Upload video"):
-        from vision.camera import VideoSource, parse_source
-        if source_mode == "Webcam (local)":
-            src = VideoSource(webcam_index)
-        elif source_mode == "Video file":
-            src = VideoSource(parse_source(video_path or "0"))
+    for frame_count, frame in enumerate(frames):
+        detections = detector.detect(frame)
+        enriched   = nav_engine.enrich(detections, frame.shape)
+        signal     = haptics.generate(enriched)
+        logger.log(enriched)
+        readings   = simulator.build_awareness(enriched, frame.shape[1])
+        direction  = simulator.suggested_direction(readings)
+
+        annotated = annotate_frame(frame, enriched)
+        _img(camera_ph, bgr_to_rgb(annotated), channels="RGB")
+
+        elapsed     = max(1e-6, time.perf_counter() - start)
+        fps         = (frame_count + 1) / elapsed
+        total_dets += len(enriched)
+        nearest     = min(
+            (d.estimated_distance for d in enriched if d.estimated_distance is not None),
+            default=None,
+        )
+        active_msgs = [d.message for d in enriched if d.message]
+        top_level   = max(
+            (d.warning_level for d in enriched),
+            key=lambda lv: _LEVEL_ORDER.get(lv, 0),
+            default="none",
+        )
+
+        fps_ph.metric("FPS",        f"{fps:.0f}")
+        near_ph.metric("Nearest",   f"{nearest:.1f} m" if nearest is not None else "clear")
+        det_ph.metric("Detections", len(enriched))
+        dir_ph.metric("Direction",  _SHORT_DIRECTION.get(direction, direction.capitalize()))
+
+        msg = " | ".join(active_msgs[:2])
+        if msg and top_level == "critical":
+            warn_ph.error(f"STOP — {msg}")
+        elif msg and top_level == "high":
+            warn_ph.warning(f"Warning — {msg}")
+        elif msg and top_level == "medium":
+            warn_ph.info(f"Caution — {msg}")
         else:
-            if not uploaded_path:
-                return None, _sim_frames(max_frames)
-            src = VideoSource(uploaded_path)
-        return src, src.frames(max_frames=max_frames)
-    # Simulation (and fallback)
-    return None, _sim_frames(max_frames)
+            warn_ph.success("Path clear")
+
+        l_pct = int(signal.left_intensity * 100)
+        r_pct = int(signal.right_intensity * 100)
+        hap_l_ph.progress(signal.left_intensity, text=f"Left motor — {l_pct}%")
+        hap_r_ph.progress(signal.right_intensity, text=f"Right motor — {r_pct}%")
+
+        _chart(sector_ph, build_sector_figure(readings), key=f"sector_{frame_count}")
+
+        level_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for d in enriched:
+            if d.warning_level in level_counts:
+                level_counts[d.warning_level] += 1
+        history.append({
+            "frame":   frame_count,
+            "count":   len(enriched),
+            "nearest": nearest if nearest is not None else 0.0,
+            **{f"level_{k}": v for k, v in level_counts.items()},
+        })
+        if len(history) >= 5:
+            _chart(chart_ph, build_session_chart(history), key=f"chart_{frame_count}")
+
+    processed = frame_count + 1
+    avg_fps   = processed / max(1e-6, time.perf_counter() - start)
+    st.success(
+        f"Done — **{processed}** frames at **{avg_fps:.1f} FPS** · "
+        f"**{total_dets}** total detections"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Frame iterator for Simulation + local webcam/video-file
+# ---------------------------------------------------------------------------
+
+def _build_frame_iterator(cfg: dict):
+    mode = cfg["source_mode"]
+    if mode in ("Webcam (local)", "Video file"):
+        from vision.camera import VideoSource, parse_source
+        if mode == "Webcam (local)":
+            src = VideoSource(cfg["webcam_index"])
+        else:
+            src = VideoSource(parse_source(cfg["video_path"] or "0"))
+        return src, src.frames(max_frames=cfg["max_frames"])
+    # Simulation (default)
+    return None, _sim_frames(cfg["max_frames"])
 
 
 def _sim_frames(max_frames: int):
@@ -400,8 +559,8 @@ def _sim_frames(max_frames: int):
 
 
 # ---------------------------------------------------------------------------
-# Browser Camera — uses st.camera_input (built into Streamlit, zero extra deps)
-# Works on Streamlit Cloud, any browser, any device including mobile.
+# Browser Camera — st.camera_input, zero extra dependencies
+# Works on Streamlit Cloud, any browser, mobile included
 # ---------------------------------------------------------------------------
 
 def _render_browser_camera_mode(cfg: dict) -> None:
@@ -422,26 +581,24 @@ def _render_browser_camera_mode(cfg: dict) -> None:
     logger     = DetectionLogger(ROOT / "logs" / "navigation_events.csv")
 
     st.markdown(
-        "Point your device camera at the scene. "
-        "Press the **camera button** to capture a frame — detection runs instantly."
+        "Point your device camera at the scene and press **Take photo** — "
+        "detection runs instantly on each captured frame."
     )
 
     col_cam, col_metrics = st.columns([3, 2])
-
     with col_cam:
-        snap = st.camera_input("Capture frame for detection")
+        snap = st.camera_input("Take photo")
 
     if snap is None:
         with col_metrics:
             st.info("Waiting for a captured frame…")
         return
 
-    # Decode the JPEG from st.camera_input → BGR numpy array
+    # Decode JPEG → BGR numpy array (PIL, no cv2 needed)
     pil_img   = PILImage.open(snap).convert("RGB")
     frame_rgb = np.array(pil_img)
     frame_bgr = frame_rgb[..., ::-1].copy()
 
-    # Run the full navigation pipeline
     detections = detector.detect(frame_bgr)
     enriched   = nav_engine.enrich(detections, frame_bgr.shape)
     signal     = haptics.generate(enriched)
@@ -449,14 +606,12 @@ def _render_browser_camera_mode(cfg: dict) -> None:
     readings   = simulator.build_awareness(enriched, frame_bgr.shape[1])
     direction  = simulator.suggested_direction(readings)
 
-    # Annotate and display
     annotated     = annotate_frame(frame_bgr, enriched)
     annotated_rgb = bgr_to_rgb(annotated)
 
     with col_cam:
         st.image(annotated_rgb, **_IMG_KW)
 
-    # Derived metrics
     nearest = min(
         (d.estimated_distance for d in enriched if d.estimated_distance is not None),
         default=None,
@@ -636,10 +791,7 @@ Centre-zone obstacles escalate one level earlier (−0.25 m bias).
 Distance values are **relative monocular estimates** from bounding-box scale and vertical
 position — not calibrated metric depth. No LiDAR or stereo camera is used.
     """)
-    st.caption(
-        "YOLO11 weights by Ultralytics. "
-        "Not for clinical or safety-critical deployment."
-    )
+    st.caption("YOLO11 weights by Ultralytics. Not for clinical or safety-critical deployment.")
 
 
 if __name__ == "__main__":
