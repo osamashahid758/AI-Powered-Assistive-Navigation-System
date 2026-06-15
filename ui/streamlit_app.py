@@ -14,11 +14,58 @@ if str(ROOT) not in sys.path:
 
 import streamlit as st
 
-# Probe once which width argument st.image / st.plotly_chart accept.
-# Older builds use use_column_width; newer builds use use_container_width.
-# Some very new builds dropped use_column_width entirely.
+from feedback.audio import AudioFeedback
+from feedback.haptics import HapticController
+from feedback.logger import DetectionLogger
+from navigation.engine import NavigationEngine
+from navigation.virtual_270 import VirtualNavigationSimulator
+from ui.components import (
+    build_sector_figure,
+    build_session_chart,
+    build_warning_level_chart,
+    detection_table_rows,
+)
+from vision.annotator import annotate_frame, bgr_to_rgb
+from vision.config import ModelConfig
+from vision.detector import create_detector
+from vision.synthetic import make_simulation_frame
+
+_LEVEL_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "none": 0}
+
+_SHORT_DIRECTION = {
+    "path ahead is relatively clear": "Clear",
+    "prefer slight left": "Go left",
+    "prefer slight right": "Go right",
+    "slow down": "Slow down",
+}
+
+
+# ---------------------------------------------------------------------------
+# Cloud / local detection
+# Streamlit Cloud sets HOME=/home/appuser.  Any other reliable signal works too.
+# Fallback: if cv2 won't import at all, we are not on a machine with a webcam.
+# ---------------------------------------------------------------------------
+
+def _detect_cloud() -> bool:
+    if os.environ.get("STREAMLIT_SHARING_MODE") == "streamlit":
+        return True
+    if os.environ.get("HOME", "") == "/home/appuser":
+        return True
+    try:
+        import cv2  # noqa: F401
+        return False          # cv2 loads fine → real machine with webcam possible
+    except Exception:
+        return True           # cv2 unavailable → treat as cloud / no-webcam
+
+
+_IS_CLOUD = _detect_cloud()
+
+
+# ---------------------------------------------------------------------------
+# Width-kwarg helpers (Streamlit changed the API between versions)
+# ---------------------------------------------------------------------------
+
 def _make_width_kwarg(fn_name: str) -> dict:
-    """Return the right width kwarg for this Streamlit build."""
     import inspect
     try:
         sig = inspect.signature(getattr(st, fn_name, None) or (lambda: None))
@@ -28,7 +75,8 @@ def _make_width_kwarg(fn_name: str) -> dict:
             return {"use_column_width": True}
     except (ValueError, TypeError):
         pass
-    return {"use_container_width": True}   # safe default for new builds
+    return {"use_container_width": True}
+
 
 _IMG_KW   = _make_width_kwarg("image")
 _CHART_KW = _make_width_kwarg("plotly_chart")
@@ -47,52 +95,9 @@ def _df(container, data):
     container.dataframe(data, **_DF_KW)
 
 
-from feedback.audio import AudioFeedback
-from feedback.haptics import HapticController
-from feedback.logger import DetectionLogger
-from navigation.engine import NavigationEngine
-from navigation.virtual_270 import VirtualNavigationSimulator
-from ui.components import (
-    build_sector_figure,
-    build_session_chart,
-    build_warning_level_chart,
-    detection_table_rows,
-)
-from vision.annotator import annotate_frame, bgr_to_rgb
-from vision.camera import VideoSource, parse_source
-from vision.config import ModelConfig
-from vision.detector import create_detector
-from vision.synthetic import make_simulation_frame
-
-_LEVEL_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "none": 0}
-
-_SHORT_DIRECTION = {
-    "path ahead is relatively clear": "Clear",
-    "prefer slight left": "Go left",
-    "prefer slight right": "Go right",
-    "slow down": "Slow down",
-}
-
-# Detect whether running on Streamlit Community Cloud
-def _detect_cloud() -> bool:
-    # Official Streamlit Cloud environment variables
-    if os.environ.get("STREAMLIT_SHARING_MODE") == "streamlit":
-        return True
-    if os.environ.get("HOME", "") == "/home/appuser":
-        return True
-    # HOSTNAME set by Streamlit Cloud containers
-    hostname = os.environ.get("HOSTNAME", "")
-    if "streamlit" in hostname.lower():
-        return True
-    # Ultimate test — if cv2 simply can't be imported, we can't use webcam
-    try:
-        import cv2  # noqa: F401
-    except Exception:
-        return True
-    return False
-
-_IS_CLOUD = _detect_cloud()
-
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     st.set_page_config(
@@ -100,7 +105,6 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
-    # Minimal top-bar custom CSS — tighten padding, clean font
     st.markdown(
         """
         <style>
@@ -127,14 +131,10 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 
 def _scan_cameras() -> list[tuple[int, str]]:
-    """Try indices 0–9 and return (index, label) for every camera that opens.
-    Falls back to [(0,'Camera 0')] if cv2 is not yet installed.
-    """
     try:
         import cv2
     except ImportError:
         return [(0, "Camera 0 (default)")]
-
     found = []
     for idx in range(10):
         cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else 0)
@@ -148,6 +148,7 @@ def _build_sidebar() -> dict:
     with st.sidebar:
         st.markdown("## Configuration")
 
+        # Cloud: no local webcam, no video-file paths
         if _IS_CLOUD:
             source_options = ["Simulation", "Browser Camera", "Upload video"]
         else:
@@ -156,14 +157,14 @@ def _build_sidebar() -> dict:
         source_mode = st.selectbox("Input source", source_options)
 
         if source_mode == "Browser Camera":
-            st.caption("Click **Run navigation** then allow camera access when the browser asks.")
+            st.caption("Allow camera access when your browser asks.")
 
         st.markdown("---")
-        model_path  = st.text_input("YOLO11 model", value="yolo11n.pt")
-        confidence  = st.slider("Confidence", 0.05, 0.95, 0.35, 0.05)
-        use_mock    = st.checkbox("Simulation detector", value=(source_mode == "Simulation"))
-        audio_on    = st.checkbox("Text-to-speech", value=False)
-        max_frames  = st.slider("Max frames", 30, 900, 180, 30)
+        model_path = st.text_input("YOLO11 model", value="yolo11n.pt")
+        confidence = st.slider("Confidence", 0.05, 0.95, 0.35, 0.05)
+        use_mock   = st.checkbox("Simulation detector", value=(source_mode == "Simulation"))
+        audio_on   = st.checkbox("Text-to-speech", value=False)
+        max_frames = st.slider("Max frames", 30, 900, 180, 30)
 
         video_path    = None
         uploaded_path = None
@@ -178,10 +179,7 @@ def _build_sidebar() -> dict:
                 labels = [label for _, label in cameras]
                 choice = st.selectbox("Select camera", labels)
                 webcam_index = cameras[labels.index(choice)][0]
-            st.caption(
-                "DroidCam: start the desktop client and connect your phone first, "
-                "then press Run."
-            )
+            st.caption("DroidCam: start the desktop client first, then press Run.")
         elif source_mode == "Video file":
             video_path = st.text_input(
                 "Video path",
@@ -221,6 +219,7 @@ def _render_live_tab() -> None:
     st.markdown("# Assistive Navigation System")
     cfg = _build_sidebar()
 
+    # Browser Camera is handled separately — no "Run" button needed
     if cfg["source_mode"] == "Browser Camera":
         _render_browser_camera_mode(cfg)
         return
@@ -229,34 +228,39 @@ def _render_live_tab() -> None:
         _show_idle_screen()
         return
 
-    # ── Build layout placeholders ────────────────────────────────────────
+    # Webcam / video-file modes need cv2 on the machine
+    if cfg["source_mode"] in ("Webcam (local)", "Video file"):
+        try:
+            import cv2  # noqa: F401
+        except Exception:
+            st.error(
+                "OpenCV (cv2) is not installed in this environment. "
+                "Use **Browser Camera**, **Upload video**, or **Simulation** instead."
+            )
+            return
+
+    # Build layout
     camera_ph = st.empty()
-
     col_info, col_sector = st.columns([5, 6])
-
     with col_info:
         mc = st.columns(2)
         fps_ph  = mc[0].empty()
         near_ph = mc[1].empty()
         det_ph  = mc[0].empty()
         dir_ph  = mc[1].empty()
-
         st.markdown("---")
         warn_ph = st.empty()
         st.markdown("---")
         st.caption("Haptic feedback")
         hap_l_ph = st.empty()
         hap_r_ph = st.empty()
-
     with col_sector:
         sector_ph = st.empty()
-
     chart_ph = st.empty()
-
     with st.expander("Detection log", expanded=False):
         table_ph = st.empty()
 
-    # ── Initialise pipeline ──────────────────────────────────────────────
+    # Build pipeline
     try:
         source, frame_iter = _build_frame_iterator(
             cfg["source_mode"], cfg["video_path"], cfg["uploaded_path"],
@@ -265,15 +269,6 @@ def _render_live_tab() -> None:
     except RuntimeError as exc:
         st.error(f"Could not open video source: {exc}")
         return
-
-    # cv2 is only needed for webcam / video-file sources
-    _needs_cv2 = cfg["source_mode"] in ("Webcam (local)", "Video file")
-    if _needs_cv2:
-        try:
-            import cv2  # noqa: F401
-        except Exception:
-            st.error("OpenCV is required for webcam/video-file mode. Run `pip install -r requirements.txt`.")
-            return
 
     detector   = create_detector(
         ModelConfig(model_path=cfg["model_path"], confidence=cfg["confidence"], use_mock=cfg["use_mock"]),
@@ -286,11 +281,10 @@ def _render_live_tab() -> None:
     logger     = DetectionLogger(ROOT / "logs" / "navigation_events.csv")
 
     history: list[dict] = []
-    start        = time.perf_counter()
-    frame_count  = 0
-    total_dets   = 0
+    start       = time.perf_counter()
+    frame_count = 0
+    total_dets  = 0
 
-    # ── Main loop ────────────────────────────────────────────────────────
     try:
         for frame_count, frame in frame_iter:
             detections = detector.detect(frame)
@@ -301,32 +295,28 @@ def _render_live_tab() -> None:
             readings   = simulator.build_awareness(enriched, frame.shape[1])
             direction  = simulator.suggested_direction(readings)
 
-            # Camera feed
             annotated = annotate_frame(frame, enriched)
             _img(camera_ph, bgr_to_rgb(annotated), channels="RGB")
 
-            # Derived values
-            elapsed      = max(1e-6, time.perf_counter() - start)
-            fps          = (frame_count + 1) / elapsed
-            total_dets  += len(enriched)
-            nearest      = min(
+            elapsed     = max(1e-6, time.perf_counter() - start)
+            fps         = (frame_count + 1) / elapsed
+            total_dets += len(enriched)
+            nearest     = min(
                 (d.estimated_distance for d in enriched if d.estimated_distance is not None),
                 default=None,
             )
-            active_msgs  = [d.message for d in enriched if d.message]
-            top_level    = max(
+            active_msgs = [d.message for d in enriched if d.message]
+            top_level   = max(
                 (d.warning_level for d in enriched),
                 key=lambda lv: _LEVEL_ORDER.get(lv, 0),
                 default="none",
             )
 
-            # 2x2 metrics
             fps_ph.metric("FPS",        f"{fps:.0f}")
             near_ph.metric("Nearest",   f"{nearest:.1f} m" if nearest is not None else "clear")
             det_ph.metric("Detections", len(enriched))
             dir_ph.metric("Direction",  _SHORT_DIRECTION.get(direction, direction.capitalize()))
 
-            # Warning banner — colour-coded, only shows when relevant
             msg = " | ".join(spoken or active_msgs[:2])
             if msg and top_level == "critical":
                 warn_ph.error(f"STOP — {msg}")
@@ -337,16 +327,13 @@ def _render_live_tab() -> None:
             else:
                 warn_ph.success("Path clear")
 
-            # Haptic progress bars
             l_pct = int(signal.left_intensity * 100)
             r_pct = int(signal.right_intensity * 100)
             hap_l_ph.progress(signal.left_intensity, text=f"Left motor — {l_pct}%")
             hap_r_ph.progress(signal.right_intensity, text=f"Right motor — {r_pct}%")
 
-            # 270° sector chart
             _chart(sector_ph, build_sector_figure(readings), key=f"sector_{frame_count}")
 
-            # Session trend chart (appears after enough data)
             level_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
             for d in enriched:
                 if d.warning_level in level_counts:
@@ -360,7 +347,6 @@ def _render_live_tab() -> None:
             if len(history) >= 5:
                 _chart(chart_ph, build_session_chart(history), key=f"chart_{frame_count}")
 
-            # Hidden detection table
             _df(table_ph, detection_table_rows(enriched))
 
             if cfg["source_mode"] == "Simulation":
@@ -370,7 +356,6 @@ def _render_live_tab() -> None:
         if source is not None:
             source.release()
 
-    # Session summary
     processed = frame_count + 1
     avg_fps   = processed / max(1e-6, time.perf_counter() - start)
     st.success(
@@ -382,7 +367,7 @@ def _render_live_tab() -> None:
 def _show_idle_screen() -> None:
     st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Input sources", "5",  "Browser cam / Local cam / Video / Upload / Simulation")
+    c1.metric("Input sources", "4",  "Browser cam / Upload / Simulation / Local webcam")
     c2.metric("AI model",      "YOLO11n", "Real-time detection")
     c3.metric("Object classes", "7", "Person, chair, stairs…")
     c4.metric("Feedback modes", "3", "Visual · Haptic · Audio")
@@ -394,15 +379,18 @@ def _show_idle_screen() -> None:
 # ---------------------------------------------------------------------------
 
 def _build_frame_iterator(source_mode, video_path, uploaded_path, max_frames, webcam_index=0):
-    if source_mode == "Webcam (local)":
-        src = VideoSource(webcam_index)
+    if source_mode in ("Webcam (local)", "Video file", "Upload video"):
+        from vision.camera import VideoSource, parse_source
+        if source_mode == "Webcam (local)":
+            src = VideoSource(webcam_index)
+        elif source_mode == "Video file":
+            src = VideoSource(parse_source(video_path or "0"))
+        else:
+            if not uploaded_path:
+                return None, _sim_frames(max_frames)
+            src = VideoSource(uploaded_path)
         return src, src.frames(max_frames=max_frames)
-    if source_mode == "Video file":
-        src = VideoSource(parse_source(video_path or "0"))
-        return src, src.frames(max_frames=max_frames)
-    if source_mode == "Upload video" and uploaded_path:
-        src = VideoSource(uploaded_path)
-        return src, src.frames(max_frames=max_frames)
+    # Simulation (and fallback)
     return None, _sim_frames(max_frames)
 
 
@@ -412,30 +400,13 @@ def _sim_frames(max_frames: int):
 
 
 # ---------------------------------------------------------------------------
-# Browser camera — live video via streamlit-webrtc
+# Browser Camera — uses st.camera_input (built into Streamlit, zero extra deps)
+# Works on Streamlit Cloud, any browser, any device including mobile.
 # ---------------------------------------------------------------------------
 
 def _render_browser_camera_mode(cfg: dict) -> None:
-    """Browser camera.
-    On Streamlit Cloud: only Snapshot mode (st.camera_input) — WebRTC needs open UDP ports.
-    Locally: choose between Snapshot and Live WebRTC.
-    """
     import numpy as np
-    from PIL import Image as _PILImage
-
-    if _IS_CLOUD:
-        cam_mode = "Snapshot (works everywhere)"
-        st.info(
-            "Running on Streamlit Cloud — using **Snapshot** mode. "
-            "Press the camera button below to capture a frame and run detection."
-        )
-    else:
-        cam_mode = st.radio(
-            "Camera method",
-            ["Snapshot (works everywhere)", "Live WebRTC (lower latency)"],
-            horizontal=True,
-            help="Snapshot captures one frame at a time. WebRTC streams continuously.",
-        )
+    from PIL import Image as PILImage
 
     detector   = create_detector(
         ModelConfig(
@@ -450,210 +421,77 @@ def _render_browser_camera_mode(cfg: dict) -> None:
     simulator  = VirtualNavigationSimulator()
     logger     = DetectionLogger(ROOT / "logs" / "navigation_events.csv")
 
-    # ------------------------------------------------------------------
-    # Sub-mode 1 — snapshot via st.camera_input (no WebRTC, no aiortc)
-    # ------------------------------------------------------------------
-    if cam_mode == "Snapshot (works everywhere)":
-        st.info("Point your camera at the scene and press the capture button.")
-
-        col_cam, col_metrics = st.columns([3, 2])
-        with col_cam:
-            snap = st.camera_input("Capture frame")
-        with col_metrics:
-            result_ph = st.empty()
-
-        if snap is not None:
-            pil_img = _PILImage.open(snap).convert("RGB")
-            frame_rgb = np.array(pil_img)
-            frame_bgr = frame_rgb[..., ::-1].copy()
-
-            detections = detector.detect(frame_bgr)
-            enriched   = nav_engine.enrich(detections, frame_bgr.shape)
-            signal     = haptics.generate(enriched)
-            logger.log(enriched)
-            readings   = simulator.build_awareness(enriched, frame_bgr.shape[1])
-            direction  = simulator.suggested_direction(readings)
-
-            annotated = annotate_frame(frame_bgr, enriched)
-            annotated_rgb = bgr_to_rgb(annotated)
-
-            with col_cam:
-                st.image(annotated_rgb, **_IMG_KW)
-
-            nearest = min(
-                (d.estimated_distance for d in enriched if d.estimated_distance is not None),
-                default=None,
-            )
-            top_level = max(
-                (d.warning_level for d in enriched),
-                key=lambda lv: _LEVEL_ORDER.get(lv, 0),
-                default="none",
-            )
-            active_msgs = [d.message for d in enriched if d.message]
-
-            with col_metrics:
-                mc = st.columns(2)
-                mc[0].metric("Detections", len(enriched))
-                mc[1].metric("Nearest",    f"{nearest:.1f} m" if nearest is not None else "clear")
-                mc[0].metric("Direction",  _SHORT_DIRECTION.get(direction, direction.capitalize()))
-                mc[1].metric("Warning",    top_level.capitalize())
-
-                st.markdown("---")
-                msg = " | ".join(active_msgs[:2])
-                if msg and top_level == "critical":
-                    st.error(f"STOP — {msg}")
-                elif msg and top_level == "high":
-                    st.warning(f"Warning — {msg}")
-                elif msg and top_level == "medium":
-                    st.info(f"Caution — {msg}")
-                else:
-                    st.success("Path clear")
-
-                l_pct = int(signal.left_intensity * 100)
-                r_pct = int(signal.right_intensity * 100)
-                st.progress(signal.left_intensity,  text=f"Left motor — {l_pct}%")
-                st.progress(signal.right_intensity, text=f"Right motor — {r_pct}%")
-
-            st.plotly_chart(build_sector_figure(readings), **_CHART_KW)
-        return
-
-    # ------------------------------------------------------------------
-    # Sub-mode 2 — live streaming via streamlit-webrtc
-    # ------------------------------------------------------------------
-    try:
-        from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
-        import av
-        import queue
-    except ImportError:
-        st.error(
-            "streamlit-webrtc / aiortc / av are not installed. "
-            "Switch to **Snapshot** mode above, or run "
-            "`pip install streamlit-webrtc aiortc av` then restart."
-        )
-        return
-
-    st.info("Allow camera access when your browser asks, then press **START** below.")
-
-    result_q: queue.Queue = queue.Queue(maxsize=1)
-
-    class NavigationProcessor(VideoProcessorBase):
-        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-            img = frame.to_ndarray(format="bgr24")
-            detections = detector.detect(img)
-            enriched   = nav_engine.enrich(detections, img.shape)
-            signal     = haptics.generate(enriched)
-            logger.log(enriched)
-            readings   = simulator.build_awareness(enriched, img.shape[1])
-            direction  = simulator.suggested_direction(readings)
-            annotated  = annotate_frame(img, enriched)
-
-            payload = dict(
-                enriched=enriched, signal=signal,
-                readings=readings, direction=direction,
-            )
-            if result_q.full():
-                try:
-                    result_q.get_nowait()
-                except queue.Empty:
-                    pass
-            result_q.put_nowait(payload)
-
-            return av.VideoFrame.from_ndarray(bgr_to_rgb(annotated), format="rgb24")
-
-    rtc_config = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
-
-    ctx = webrtc_streamer(
-        key="nav-camera",
-        video_processor_factory=NavigationProcessor,
-        rtc_configuration=rtc_config,
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
+    st.markdown(
+        "Point your device camera at the scene. "
+        "Press the **camera button** to capture a frame — detection runs instantly."
     )
 
-    st.markdown("---")
-    col_info, col_sector = st.columns([5, 6])
+    col_cam, col_metrics = st.columns([3, 2])
 
-    with col_info:
+    with col_cam:
+        snap = st.camera_input("Capture frame for detection")
+
+    if snap is None:
+        with col_metrics:
+            st.info("Waiting for a captured frame…")
+        return
+
+    # Decode the JPEG from st.camera_input → BGR numpy array
+    pil_img   = PILImage.open(snap).convert("RGB")
+    frame_rgb = np.array(pil_img)
+    frame_bgr = frame_rgb[..., ::-1].copy()
+
+    # Run the full navigation pipeline
+    detections = detector.detect(frame_bgr)
+    enriched   = nav_engine.enrich(detections, frame_bgr.shape)
+    signal     = haptics.generate(enriched)
+    logger.log(enriched)
+    readings   = simulator.build_awareness(enriched, frame_bgr.shape[1])
+    direction  = simulator.suggested_direction(readings)
+
+    # Annotate and display
+    annotated     = annotate_frame(frame_bgr, enriched)
+    annotated_rgb = bgr_to_rgb(annotated)
+
+    with col_cam:
+        st.image(annotated_rgb, **_IMG_KW)
+
+    # Derived metrics
+    nearest = min(
+        (d.estimated_distance for d in enriched if d.estimated_distance is not None),
+        default=None,
+    )
+    top_level = max(
+        (d.warning_level for d in enriched),
+        key=lambda lv: _LEVEL_ORDER.get(lv, 0),
+        default="none",
+    )
+    active_msgs = [d.message for d in enriched if d.message]
+
+    with col_metrics:
         mc = st.columns(2)
-        fps_ph  = mc[0].empty()
-        near_ph = mc[1].empty()
-        det_ph  = mc[0].empty()
-        dir_ph  = mc[1].empty()
+        mc[0].metric("Detections", len(enriched))
+        mc[1].metric("Nearest",    f"{nearest:.1f} m" if nearest is not None else "clear")
+        mc[0].metric("Direction",  _SHORT_DIRECTION.get(direction, direction.capitalize()))
+        mc[1].metric("Warning",    top_level.capitalize())
+
         st.markdown("---")
-        warn_ph = st.empty()
-        st.markdown("---")
-        st.caption("Haptic feedback")
-        hap_l_ph = st.empty()
-        hap_r_ph = st.empty()
-
-    with col_sector:
-        sector_ph = st.empty()
-
-    history: list[dict] = []
-    chart_ph = st.empty()
-
-    import time as _time
-    start = _time.perf_counter()
-    frame_count = 0
-
-    while ctx.state.playing:
-        try:
-            payload = result_q.get(timeout=0.5)
-        except queue.Empty:
-            continue
-
-        enriched  = payload["enriched"]
-        signal    = payload["signal"]
-        readings  = payload["readings"]
-        direction = payload["direction"]
-        frame_count += 1
-
-        elapsed = max(1e-6, _time.perf_counter() - start)
-        fps     = frame_count / elapsed
-        nearest = min(
-            (d.estimated_distance for d in enriched if d.estimated_distance is not None),
-            default=None,
-        )
-        active_msgs = [d.message for d in enriched if d.message]
-        top_level   = max(
-            (d.warning_level for d in enriched),
-            key=lambda lv: _LEVEL_ORDER.get(lv, 0),
-            default="none",
-        )
-
-        fps_ph.metric("FPS",        f"{fps:.0f}")
-        near_ph.metric("Nearest",   f"{nearest:.1f} m" if nearest is not None else "clear")
-        det_ph.metric("Detections", len(enriched))
-        dir_ph.metric("Direction",  _SHORT_DIRECTION.get(direction, direction.capitalize()))
-
         msg = " | ".join(active_msgs[:2])
         if msg and top_level == "critical":
-            warn_ph.error(f"STOP — {msg}")
+            st.error(f"STOP — {msg}")
         elif msg and top_level == "high":
-            warn_ph.warning(f"Warning — {msg}")
+            st.warning(f"Warning — {msg}")
         elif msg and top_level == "medium":
-            warn_ph.info(f"Caution — {msg}")
+            st.info(f"Caution — {msg}")
         else:
-            warn_ph.success("Path clear")
+            st.success("Path clear")
 
         l_pct = int(signal.left_intensity * 100)
         r_pct = int(signal.right_intensity * 100)
-        hap_l_ph.progress(signal.left_intensity, text=f"Left motor — {l_pct}%")
-        hap_r_ph.progress(signal.right_intensity, text=f"Right motor — {r_pct}%")
+        st.progress(signal.left_intensity,  text=f"Left motor — {l_pct}%")
+        st.progress(signal.right_intensity, text=f"Right motor — {r_pct}%")
 
-        _chart(sector_ph, build_sector_figure(readings))
-
-        level_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
-        for d in enriched:
-            if d.warning_level in level_counts:
-                level_counts[d.warning_level] += 1
-        history.append({
-            "frame": frame_count, "count": len(enriched),
-            "nearest": nearest if nearest is not None else 0.0,
-            **{f"level_{k}": v for k, v in level_counts.items()},
-        })
-        if len(history) >= 5:
-            _chart(chart_ph, build_session_chart(history))
+    st.plotly_chart(build_sector_figure(readings), **_CHART_KW)
 
 
 # ---------------------------------------------------------------------------
@@ -667,17 +505,13 @@ def _render_evaluation_tab() -> None:
     col_gt, col_pred = st.columns(2)
     with col_gt:
         gt_file = st.file_uploader(
-            "Ground-truth CSV",
-            type=["csv"],
-            key="gt_upload",
+            "Ground-truth CSV", type=["csv"], key="gt_upload",
             help="Columns: frame_id, object, xmin, ymin, xmax, ymax",
         )
         use_sample_gt = st.checkbox("Use bundled sample", key="use_sample_gt")
     with col_pred:
         pred_file = st.file_uploader(
-            "Predictions CSV",
-            type=["csv"],
-            key="pred_upload",
+            "Predictions CSV", type=["csv"], key="pred_upload",
             help="Columns: frame_id, object, xmin, ymin, xmax, ymax, confidence",
         )
         use_sample_pred = st.checkbox("Use bundled sample", key="use_sample_pred")
@@ -717,11 +551,11 @@ def _render_evaluation_tab() -> None:
 
     st.markdown("---")
     rc = st.columns(5)
-    rc[0].metric("Precision",        f"{metrics.precision:.3f}")
-    rc[1].metric("Recall",           f"{metrics.recall:.3f}")
-    rc[2].metric("F1",               f"{metrics.f1:.3f}")
-    rc[3].metric("True Positives",   metrics.true_positives)
-    rc[4].metric("FP / FN",          f"{metrics.false_positives} / {metrics.false_negatives}")
+    rc[0].metric("Precision",      f"{metrics.precision:.3f}")
+    rc[1].metric("Recall",         f"{metrics.recall:.3f}")
+    rc[2].metric("F1",             f"{metrics.f1:.3f}")
+    rc[3].metric("True Positives", metrics.true_positives)
+    rc[4].metric("FP / FN",        f"{metrics.false_positives} / {metrics.false_negatives}")
 
     _chart(st, _metrics_bar(metrics))
 
@@ -740,12 +574,10 @@ def _metrics_bar(metrics):
         textposition="outside",
     ))
     fig.update_layout(
-        height=260,
-        margin=dict(l=10, r=10, t=20, b=10),
+        height=260, margin=dict(l=10, r=10, t=20, b=10),
         yaxis=dict(range=[0, 1.15], showgrid=False),
         xaxis=dict(showgrid=False),
-        plot_bgcolor="#0e1117",
-        paper_bgcolor="#0e1117",
+        plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
         font=dict(color="#fafafa", size=14),
     )
     return fig
@@ -803,7 +635,6 @@ Centre-zone obstacles escalate one level earlier (−0.25 m bias).
 
 Distance values are **relative monocular estimates** from bounding-box scale and vertical
 position — not calibrated metric depth. No LiDAR or stereo camera is used.
-Values are appropriate for hazard ranking in a dissertation demonstration context.
     """)
     st.caption(
         "YOLO11 weights by Ultralytics. "
