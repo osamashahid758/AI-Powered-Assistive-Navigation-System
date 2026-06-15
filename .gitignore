@@ -1,2 +1,6 @@
 /.claude
 /AI-powered assistive technology.docx
+# Compiled Python
+__pycache__/
+*.pyc
+*.pyo
