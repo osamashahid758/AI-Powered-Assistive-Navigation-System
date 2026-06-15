@@ -39,9 +39,12 @@ def _cv2_available() -> bool:
 # Public API
 # ---------------------------------------------------------------------------
 
-def annotate_frame(frame: Any, detections: list[Detection], draw_zones: bool = True) -> Any:
-    """Draw zones, bounding boxes, labels, distance, and warning level."""
-    if _cv2_available():
+def annotate_frame(frame: Any, detections: list[Detection], draw_zones: bool = True, force_pil: bool = False) -> Any:
+    """Draw zones, bounding boxes, labels, distance, and warning level.
+
+    force_pil=True bypasses cv2 even if it's available (used for simulation and browser-snapshot frames).
+    """
+    if not force_pil and _cv2_available():
         return _annotate_cv2(frame, detections, draw_zones)
     return _annotate_pil(frame, detections, draw_zones)
 
@@ -98,13 +101,13 @@ def _draw_label_cv2(cv2: Any, frame: Any, label: str, x: int, y: int, color: tup
 # ---------------------------------------------------------------------------
 
 def _annotate_pil(frame: Any, detections: list[Detection], draw_zones: bool) -> Any:
+    """PIL-based annotation. Input is BGR (same as cv2 convention). Returns BGR."""
     from PIL import Image, ImageDraw, ImageFont
 
-    arr = np.asarray(frame)
-    # synthetic.py produces RGB; VideoSource (cv2) produces BGR — normalise to RGB
-    # We detect BGR by checking if arr came from cv2 (not possible to detect definitively,
-    # but simulation frames are always RGB from synthetic.py, live frames are BGR)
-    pil_img = Image.fromarray(arr.astype(np.uint8))
+    arr = np.asarray(frame).astype(np.uint8)
+    # All frames in this pipeline are BGR (cv2 convention) — convert to RGB for PIL
+    rgb = arr[..., ::-1].copy()
+    pil_img = Image.fromarray(rgb)
     draw = ImageDraw.Draw(pil_img)
 
     width, height = pil_img.size
@@ -118,9 +121,10 @@ def _annotate_pil(frame: Any, detections: list[Detection], draw_zones: bool) -> 
             font = ImageFont.truetype("arial.ttf", 14)
         except Exception:
             font = ImageFont.load_default()
-        draw.text((12, 8),        "LEFT",   fill=ZONE_COLORS["left"],   font=font)
-        draw.text((lb + 12, 8),   "CENTRE", fill=ZONE_COLORS["centre"], font=font)
-        draw.text((rb + 12, 8),   "RIGHT",  fill=ZONE_COLORS["right"],  font=font)
+        # Colors stored as BGR — flip to RGB for PIL
+        draw.text((12, 8),        "LEFT",   fill=ZONE_COLORS["left"][::-1],   font=font)
+        draw.text((lb + 12, 8),   "CENTRE", fill=ZONE_COLORS["centre"][::-1], font=font)
+        draw.text((rb + 12, 8),   "RIGHT",  fill=ZONE_COLORS["right"][::-1],  font=font)
 
     try:
         font_label = ImageFont.truetype("arial.ttf", 11)
@@ -129,12 +133,14 @@ def _annotate_pil(frame: Any, detections: list[Detection], draw_zones: bool) -> 
 
     for det in detections:
         x1, y1, x2, y2 = det.bbox.as_int_tuple()
-        color = WARNING_COLORS.get(det.warning_level, WARNING_COLORS["none"])
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+        color_bgr = WARNING_COLORS.get(det.warning_level, WARNING_COLORS["none"])
+        color_rgb = color_bgr[::-1]  # PIL needs RGB
+        draw.rectangle([x1, y1, x2, y2], outline=color_rgb, width=2)
         dist_text = f"{det.estimated_distance:.2f}m" if det.estimated_distance else "n/a"
         label = f"{det.label} {det.confidence:.2f} | {det.zone or '?'} | {dist_text}"
         bbox_text = draw.textbbox((x1, max(18, y1 - 8)), label, font=font_label)
-        draw.rectangle(bbox_text, fill=color)
+        draw.rectangle(bbox_text, fill=color_rgb)
         draw.text((x1 + 2, max(18, y1 - 8)), label, fill=(255, 255, 255), font=font_label)
 
-    return np.array(pil_img)
+    # Convert back to BGR so the return value matches the cv2 path
+    return np.array(pil_img)[..., ::-1].copy()

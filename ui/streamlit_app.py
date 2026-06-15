@@ -59,7 +59,7 @@ from ui.components import (
     detection_table_rows,
 )
 from vision.annotator import annotate_frame, bgr_to_rgb
-from vision.camera import VideoSource, parse_source, require_cv2
+from vision.camera import VideoSource, parse_source
 from vision.config import ModelConfig
 from vision.detector import create_detector
 from vision.synthetic import make_simulation_frame
@@ -73,13 +73,21 @@ _SHORT_DIRECTION = {
     "slow down": "Slow down",
 }
 
-# Detect whether running on Streamlit Community Cloud (no webcam available)
+# Detect whether running on Streamlit Community Cloud
 def _detect_cloud() -> bool:
+    # Official Streamlit Cloud environment variables
     if os.environ.get("STREAMLIT_SHARING_MODE") == "streamlit":
         return True
     if os.environ.get("HOME", "") == "/home/appuser":
         return True
-    if sys.platform == "linux" and not Path("/dev/video0").exists():
+    # HOSTNAME set by Streamlit Cloud containers
+    hostname = os.environ.get("HOSTNAME", "")
+    if "streamlit" in hostname.lower():
+        return True
+    # Ultimate test — if cv2 simply can't be imported, we can't use webcam
+    try:
+        import cv2  # noqa: F401
+    except Exception:
         return True
     return False
 
@@ -258,13 +266,13 @@ def _render_live_tab() -> None:
         st.error(f"Could not open video source: {exc}")
         return
 
-    # cv2 is only needed for webcam / video-file sources, not simulation or upload-via-PIL
+    # cv2 is only needed for webcam / video-file sources
     _needs_cv2 = cfg["source_mode"] in ("Webcam (local)", "Video file")
     if _needs_cv2:
         try:
-            require_cv2()
-        except RuntimeError as exc:
-            st.error(str(exc))
+            import cv2  # noqa: F401
+        except Exception:
+            st.error("OpenCV is required for webcam/video-file mode. Run `pip install -r requirements.txt`.")
             return
 
     detector   = create_detector(
