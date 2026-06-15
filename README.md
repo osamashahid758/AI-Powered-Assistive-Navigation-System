@@ -2,7 +2,7 @@
 
 > **MSc Dissertation Prototype** — Real-time obstacle detection and spatial awareness for visually impaired users, powered by YOLO11, OpenCV, and Streamlit.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://share.streamlit.io/osamashahid758/build-a-complete-msc-dissertation-prototype/main/app.py)
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://share.streamlit.io/OsamaZaidi75/AI-Powered-Assistive-Navigation-System/main/app.py)
 
 ---
 
@@ -11,7 +11,7 @@
 Click the badge above **or** open this URL in any browser:
 
 ```
-https://share.streamlit.io/osamashahid758/build-a-complete-msc-dissertation-prototype/main/app.py
+https://share.streamlit.io/OsamaZaidi75/AI-Powered-Assistive-Navigation-System/main/app.py
 ```
 
 > The cloud version runs **Simulation** and **Upload video** modes.  
@@ -31,7 +31,7 @@ Click **"New app"** and fill in:
 
 | Field | Value |
 |---|---|
-| Repository | `osamashahid758/build-a-complete-msc-dissertation-prototype` |
+| Repository | `OsamaZaidi75/AI-Powered-Assistive-Navigation-System` |
 | Branch | `main` |
 | Main file path | `app.py` |
 
@@ -69,7 +69,7 @@ Everything runs in a **single browser dashboard** — no hardware needed beyond 
 ### Windows
 
 ```powershell
-cd build-a-complete-msc-dissertation-prototype\outputs\assistive_navigation_system
+cd AI-Powered-Assistive-Navigation-System
 python start.py
 ```
 
@@ -78,7 +78,7 @@ Or **double-click `start.bat`** inside that folder.
 ### macOS / Linux
 
 ```bash
-cd build-a-complete-msc-dissertation-prototype/outputs/assistive_navigation_system
+cd AI-Powered-Assistive-Navigation-System
 python3 start.py
 ```
 
@@ -173,7 +173,7 @@ Centre-zone obstacles escalate one level earlier (−0.25 m bias) because the us
 
 ## CLI Usage
 
-Run these from inside `build-a-complete-msc-dissertation-prototype/outputs/assistive_navigation_system/` with the venv active.
+Run these from inside `AI-Powered-Assistive-Navigation-System/` with the venv active.
 
 ```powershell
 # Run on a sample video with display window (simulation detector)
@@ -196,34 +196,30 @@ python evaluation\benchmark.py --source samples\centre_stairs_door.avi --mock --
 ## Project Structure
 
 ```
-build-a-complete-msc-dissertation-prototype/
-└── outputs/
-    └── assistive_navigation_system/   ← main project folder
-        │
-        ├── start.py / start.bat / start.sh   ONE-COMMAND LAUNCHER
-        ├── requirements.txt
-        ├── Dockerfile / docker-compose.yml
-        │
-        ├── ui/                Streamlit dashboard + chart components
-        ├── vision/            YOLO11 detector, camera, annotation
-        ├── navigation/        Zones, distance, risk, 270° awareness
-        ├── feedback/          Haptics, audio (TTS), CSV logger
-        ├── evaluation/        Precision/recall metrics, FPS benchmark
-        ├── scripts/           CLI runner, sample video generator
-        ├── samples/           Two synthetic AVI videos + CSV files
-        ├── logs/              Runtime detection log (auto-created)
-        ├── tests/             4 unit tests (pytest)
-        └── docs/              Installation guide, user manual, UML
+AI-Powered-Assistive-Navigation-System/
+│
+├── start.py / start.bat / start.sh   ONE-COMMAND LAUNCHER
+├── requirements.txt
+├── packages.txt
+│
+├── ui/                Streamlit dashboard + chart components
+├── vision/            YOLO11 detector, camera, annotation
+├── navigation/        Zones, distance, risk, 270° awareness
+├── feedback/          Haptics, audio (TTS), CSV logger
+├── evaluation/        Precision/recall metrics, FPS benchmark
+├── scripts/           CLI runner, sample video generator
+├── samples/           Two synthetic AVI videos + CSV files
+├── logs/              Runtime detection log (auto-created)
+├── tests/             4 unit tests (pytest)
+└── docs/              Installation guide, user manual, UML
 ```
-
-Full file-by-file breakdown in [`outputs/assistive_navigation_system/README.md`](build-a-complete-msc-dissertation-prototype/outputs/assistive_navigation_system/README.md).
 
 ---
 
 ## Running Tests
 
 ```powershell
-cd build-a-complete-msc-dissertation-prototype\outputs\assistive_navigation_system
+cd AI-Powered-Assistive-Navigation-System
 .\.venv\Scripts\Activate.ps1
 python -m pytest tests/ -v
 ```
@@ -235,7 +231,7 @@ All 4 tests cover: zone assignment, distance ordering, haptic logic, precision/r
 ## Docker
 
 ```powershell
-cd build-a-complete-msc-dissertation-prototype\outputs\assistive_navigation_system
+cd AI-Powered-Assistive-Navigation-System
 docker build -t assistive-nav .
 docker run --rm -p 8501:8501 assistive-nav
 ```

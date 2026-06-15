@@ -52,8 +52,13 @@ def annotate_frame(frame: Any, detections: list[Detection], draw_zones: bool = T
 def bgr_to_rgb(frame: Any) -> Any:
     """Convert an OpenCV BGR frame to RGB for Streamlit."""
 
-    cv2 = require_cv2()
-    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    try:
+        cv2 = require_cv2()
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    except RuntimeError:
+        import numpy as np
+        arr = np.asarray(frame)
+        return arr[..., ::-1].copy()
 
 
 def _draw_zone_overlay(cv2: Any, frame: Any, width: int, height: int) -> None:

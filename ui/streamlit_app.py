@@ -405,24 +405,19 @@ def _sim_frames(max_frames: int):
 # ---------------------------------------------------------------------------
 
 def _render_browser_camera_mode(cfg: dict) -> None:
-    """Live browser camera using streamlit-webrtc — works on cloud and any browser."""
+    """Browser camera with two sub-modes:
+    1. Snapshot mode (st.camera_input) — works on every platform including Streamlit Cloud.
+    2. Live WebRTC mode (streamlit-webrtc) — lower latency but requires STUN reachability.
+    """
+    import numpy as np
+    from PIL import Image as _PILImage
 
-    try:
-        from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
-        import av
-        import numpy as np
-    except ImportError:
-        st.error(
-            "streamlit-webrtc is not installed. "
-            "Run `pip install streamlit-webrtc aiortc av` then restart."
-        )
-        return
-
-    st.info("Allow camera access when your browser asks, then press **START** below.")
-
-    # Shared state between the video processor and the main thread
-    import threading
-    import queue
+    cam_mode = st.radio(
+        "Camera method",
+        ["Snapshot (works everywhere)", "Live WebRTC (lower latency)"],
+        horizontal=True,
+        help="Snapshot captures one frame at a time. WebRTC streams continuously.",
+    )
 
     detector   = create_detector(
         ModelConfig(
@@ -437,6 +432,90 @@ def _render_browser_camera_mode(cfg: dict) -> None:
     simulator  = VirtualNavigationSimulator()
     logger     = DetectionLogger(ROOT / "logs" / "navigation_events.csv")
 
+    # ------------------------------------------------------------------
+    # Sub-mode 1 — snapshot via st.camera_input (no WebRTC, no aiortc)
+    # ------------------------------------------------------------------
+    if cam_mode == "Snapshot (works everywhere)":
+        st.info("Point your camera at the scene and press the capture button.")
+
+        col_cam, col_metrics = st.columns([3, 2])
+        with col_cam:
+            snap = st.camera_input("Capture frame")
+        with col_metrics:
+            result_ph = st.empty()
+
+        if snap is not None:
+            pil_img = _PILImage.open(snap).convert("RGB")
+            frame_rgb = np.array(pil_img)
+            frame_bgr = frame_rgb[..., ::-1].copy()
+
+            detections = detector.detect(frame_bgr)
+            enriched   = nav_engine.enrich(detections, frame_bgr.shape)
+            signal     = haptics.generate(enriched)
+            logger.log(enriched)
+            readings   = simulator.build_awareness(enriched, frame_bgr.shape[1])
+            direction  = simulator.suggested_direction(readings)
+
+            annotated = annotate_frame(frame_bgr, enriched)
+            annotated_rgb = bgr_to_rgb(annotated)
+
+            with col_cam:
+                st.image(annotated_rgb, **_IMG_KW)
+
+            nearest = min(
+                (d.estimated_distance for d in enriched if d.estimated_distance is not None),
+                default=None,
+            )
+            top_level = max(
+                (d.warning_level for d in enriched),
+                key=lambda lv: _LEVEL_ORDER.get(lv, 0),
+                default="none",
+            )
+            active_msgs = [d.message for d in enriched if d.message]
+
+            with col_metrics:
+                mc = st.columns(2)
+                mc[0].metric("Detections", len(enriched))
+                mc[1].metric("Nearest",    f"{nearest:.1f} m" if nearest is not None else "clear")
+                mc[0].metric("Direction",  _SHORT_DIRECTION.get(direction, direction.capitalize()))
+                mc[1].metric("Warning",    top_level.capitalize())
+
+                st.markdown("---")
+                msg = " | ".join(active_msgs[:2])
+                if msg and top_level == "critical":
+                    st.error(f"STOP — {msg}")
+                elif msg and top_level == "high":
+                    st.warning(f"Warning — {msg}")
+                elif msg and top_level == "medium":
+                    st.info(f"Caution — {msg}")
+                else:
+                    st.success("Path clear")
+
+                l_pct = int(signal.left_intensity * 100)
+                r_pct = int(signal.right_intensity * 100)
+                st.progress(signal.left_intensity,  text=f"Left motor — {l_pct}%")
+                st.progress(signal.right_intensity, text=f"Right motor — {r_pct}%")
+
+            st.plotly_chart(build_sector_figure(readings), **_CHART_KW)
+        return
+
+    # ------------------------------------------------------------------
+    # Sub-mode 2 — live streaming via streamlit-webrtc
+    # ------------------------------------------------------------------
+    try:
+        from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+        import av
+        import queue
+    except ImportError:
+        st.error(
+            "streamlit-webrtc / aiortc / av are not installed. "
+            "Switch to **Snapshot** mode above, or run "
+            "`pip install streamlit-webrtc aiortc av` then restart."
+        )
+        return
+
+    st.info("Allow camera access when your browser asks, then press **START** below.")
+
     result_q: queue.Queue = queue.Queue(maxsize=1)
 
     class NavigationProcessor(VideoProcessorBase):
@@ -450,7 +529,6 @@ def _render_browser_camera_mode(cfg: dict) -> None:
             direction  = simulator.suggested_direction(readings)
             annotated  = annotate_frame(img, enriched)
 
-            # Push latest result for the UI to display metrics
             payload = dict(
                 enriched=enriched, signal=signal,
                 readings=readings, direction=direction,
@@ -474,7 +552,6 @@ def _render_browser_camera_mode(cfg: dict) -> None:
         async_processing=True,
     )
 
-    # Live metrics panel below the video
     st.markdown("---")
     col_info, col_sector = st.columns([5, 6])
 
