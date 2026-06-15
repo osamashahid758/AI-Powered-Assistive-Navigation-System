@@ -8,13 +8,12 @@ from typing import Iterator
 
 
 def require_cv2():
-    """Import OpenCV with a helpful installation error."""
-
+    """Import OpenCV, raising RuntimeError on any failure."""
     try:
         import cv2
+        return cv2
     except Exception as exc:
         raise RuntimeError("OpenCV is required. Run `pip install -r requirements.txt`.") from exc
-    return cv2
 
 
 @dataclass

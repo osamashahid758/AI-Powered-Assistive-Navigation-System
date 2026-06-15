@@ -7,7 +7,6 @@ from typing import Any
 import numpy as np
 
 from navigation.zones import ZoneAssigner
-from vision.camera import require_cv2
 from vision.detections import Detection
 
 
@@ -29,9 +28,9 @@ WARNING_COLORS = {
 
 def _cv2_available() -> bool:
     try:
-        require_cv2()
+        import cv2  # noqa: F401
         return True
-    except RuntimeError:
+    except Exception:
         return False
 
 
@@ -52,9 +51,9 @@ def annotate_frame(frame: Any, detections: list[Detection], draw_zones: bool = T
 def bgr_to_rgb(frame: Any) -> Any:
     """Convert a BGR frame to RGB for Streamlit."""
     try:
-        cv2 = require_cv2()
+        import cv2
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    except RuntimeError:
+    except Exception:
         arr = np.asarray(frame)
         return arr[..., ::-1].copy()
 
@@ -64,7 +63,7 @@ def bgr_to_rgb(frame: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 def _annotate_cv2(frame: Any, detections: list[Detection], draw_zones: bool) -> Any:
-    cv2 = require_cv2()
+    import cv2
     output = frame.copy()
     height, width = output.shape[:2]
     if draw_zones:
