@@ -126,14 +126,16 @@ def _build_sidebar() -> dict:
     with st.sidebar:
         st.markdown("## Configuration")
 
-        # On cloud hosting, webcam is not available
         if _IS_CLOUD:
-            source_options = ["Simulation", "Upload video"]
-            st.info("Running on cloud — Webcam and local Video file not available. Use **Simulation** or **Upload video**.")
+            source_options = ["Simulation", "Browser Camera", "Upload video"]
         else:
-            source_options = ["Simulation", "Webcam", "Video file", "Upload video"]
+            source_options = ["Simulation", "Browser Camera", "Webcam (local)", "Video file", "Upload video"]
 
         source_mode = st.selectbox("Input source", source_options)
+
+        if source_mode == "Browser Camera":
+            st.caption("Click **Run navigation** then allow camera access when the browser asks.")
+
         st.markdown("---")
         model_path  = st.text_input("YOLO11 model", value="yolo11n.pt")
         confidence  = st.slider("Confidence", 0.05, 0.95, 0.35, 0.05)
@@ -145,7 +147,7 @@ def _build_sidebar() -> dict:
         uploaded_path = None
         webcam_index  = 0
 
-        if source_mode == "Webcam":
+        if source_mode == "Webcam (local)":
             cameras = _scan_cameras()
             if len(cameras) == 1:
                 webcam_index = cameras[0][0]
@@ -155,8 +157,8 @@ def _build_sidebar() -> dict:
                 choice = st.selectbox("Select camera", labels)
                 webcam_index = cameras[labels.index(choice)][0]
             st.caption(
-                "DroidCam: make sure the DroidCam desktop app is running "
-                "and connected **before** pressing Run."
+                "DroidCam: start the desktop client and connect your phone first, "
+                "then press Run."
             )
         elif source_mode == "Video file":
             video_path = st.text_input(
@@ -197,6 +199,15 @@ def _render_live_tab() -> None:
     st.markdown("# Assistive Navigation System")
     cfg = _build_sidebar()
 
+    # Browser camera mode uses st.camera_input — render it BEFORE the run button check
+    # so the widget appears and the browser can request permission.
+    browser_img = None
+    if cfg["source_mode"] == "Browser Camera":
+        browser_img = st.camera_input(
+            "Point your camera at the scene",
+            help="Allow camera access when the browser asks, then press Run navigation.",
+        )
+
     if not cfg["run"]:
         _show_idle_screen()
         return
@@ -232,7 +243,7 @@ def _render_live_tab() -> None:
     try:
         source, frame_iter = _build_frame_iterator(
             cfg["source_mode"], cfg["video_path"], cfg["uploaded_path"],
-            cfg["max_frames"], cfg["webcam_index"],
+            cfg["max_frames"], cfg["webcam_index"], browser_img,
         )
     except RuntimeError as exc:
         st.error(f"Could not open video source: {exc}")
@@ -351,7 +362,7 @@ def _render_live_tab() -> None:
 def _show_idle_screen() -> None:
     st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Input sources", "4",  "Webcam / Video / Upload / Simulation")
+    c1.metric("Input sources", "5",  "Browser cam / Local cam / Video / Upload / Simulation")
     c2.metric("AI model",      "YOLO11n", "Real-time detection")
     c3.metric("Object classes", "7", "Person, chair, stairs…")
     c4.metric("Feedback modes", "3", "Visual · Haptic · Audio")
@@ -362,8 +373,10 @@ def _show_idle_screen() -> None:
 # Frame iterator helpers
 # ---------------------------------------------------------------------------
 
-def _build_frame_iterator(source_mode, video_path, uploaded_path, max_frames, webcam_index=0):
-    if source_mode == "Webcam":
+def _build_frame_iterator(source_mode, video_path, uploaded_path, max_frames, webcam_index=0, browser_img=None):
+    if source_mode == "Browser Camera":
+        return None, _browser_camera_frames(browser_img, max_frames)
+    if source_mode == "Webcam (local)":
         src = VideoSource(webcam_index)
         return src, src.frames(max_frames=max_frames)
     if source_mode == "Video file":
@@ -373,6 +386,38 @@ def _build_frame_iterator(source_mode, video_path, uploaded_path, max_frames, we
         src = VideoSource(uploaded_path)
         return src, src.frames(max_frames=max_frames)
     return None, _sim_frames(max_frames)
+
+
+def _browser_camera_frames(browser_img, max_frames: int):
+    """Convert st.camera_input image(s) to numpy frames for the pipeline.
+
+    st.camera_input returns a single JPEG snapshot each time the shutter is
+    pressed.  We decode it and yield it repeatedly so the rest of the pipeline
+    (which expects a frame iterator) works unchanged.  On the cloud the user
+    presses the camera shutter, sees the analysis, and can press again for a
+    new frame.
+    """
+    import io
+    try:
+        import numpy as np
+        from PIL import Image as PILImage
+    except ImportError:
+        return
+
+    if browser_img is None:
+        # No image captured yet — yield the simulation as a placeholder
+        yield from _sim_frames(max_frames)
+        return
+
+    # Decode the JPEG bytes from st.camera_input into a numpy BGR frame
+    pil_img = PILImage.open(io.BytesIO(browser_img.getvalue()))
+    frame_rgb = np.array(pil_img.convert("RGB"))
+    # Convert RGB -> BGR for OpenCV-based annotator
+    frame_bgr = frame_rgb[:, :, ::-1].copy()
+
+    for idx in range(max_frames):
+        yield idx, frame_bgr
+        time.sleep(0.05)
 
 
 def _sim_frames(max_frames: int):
